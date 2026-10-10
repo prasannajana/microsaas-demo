@@ -1,0 +1,72 @@
+# Development stack with hot reload:
+#   docker compose -f docker-compose.dev.yml up --build
+# Backend: http://localhost:8000 (uvicorn --reload, ./backend mounted)
+# Frontend: http://localhost:5173 (Vite dev server, ./frontend mounted)
+
+name: project-verification-dev
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-project_verification}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data_dev:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  backend:
+    build:
+      context: ./backend
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@db:5432/${POSTGRES_DB:-project_verification}
+      ENV: development
+      SCAN_WORKDIR: /tmp/project-verification
+      FRONTEND_URL: http://localhost:5173
+      ALLOWED_ORIGINS: '["http://localhost:5173"]'
+    # Entrypoint still runs `alembic upgrade head` before this command.
+    # Single worker (scan cleanup on startup is process-local).
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1", "--reload", "--reload-dir", "/app/app"]
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend:/app
+    # Size-capped tmpfs for clones (same as production).
+    tmpfs:
+      - /tmp/project-verification:size=1g,uid=1000,gid=1000,mode=0700,noexec,nosuid,nodev
+    mem_limit: 2g
+    pids_limit: 256
+
+  frontend:
+    image: node:22-alpine
+    working_dir: /app
+    command: ["sh", "-c", "npm install && npm run dev -- --host 0.0.0.0 --port 5173"]
+    environment:
+      VITE_API_URL: ${VITE_API_URL:-http://localhost:8000}
+      # Reliable file watching on bind mounts (macOS/Windows).
+      CHOKIDAR_USEPOLLING: "true"
+    ports:
+      - "5173:5173"
+    volumes:
+      - ./frontend:/app
+      # Keep container node_modules separate from the host's.
+      - frontend_node_modules:/app/node_modules
+    depends_on:
+      - backend
+
+volumes:
+  postgres_data_dev:
+  frontend_node_modules:

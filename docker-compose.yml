@@ -1,0 +1,74 @@
+# Production-like stack: docker compose up -d --build
+# Requires a .env at repo root (copy .env.example). DATABASE_URL is overridden
+# below to point at the `db` service. SECRET_KEY must be set (shell or .env) to a random
+# value of >= 32 chars: the backend refuses to start in production with a placeholder.
+
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-project_verification}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  backend:
+    build:
+      context: ./backend
+    restart: unless-stopped
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      ENV: production
+      SECRET_KEY: ${SECRET_KEY:?SECRET_KEY must be set}
+      DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@db:5432/${POSTGRES_DB:-project_verification}
+      SCAN_WORKDIR: /tmp/project-verification
+      # The production frontend is served on :3000, so allow it alongside the Vite dev port.
+      FRONTEND_URL: ${DOCKER_FRONTEND_URL:-http://localhost:3000}
+      ALLOWED_ORIGINS: '${DOCKER_ALLOWED_ORIGINS:-["http://localhost:3000","http://localhost:5173"]}'
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    # Repo clones live on a size-capped tmpfs (owned by the non-root appuser, uid 1000):
+    # a checkout bomb can at worst fill this 1 GiB, never the host disk, and nothing
+    # survives a restart. tmpfs pages count against mem_limit, so keep mem_limit above it.
+    tmpfs:
+      - /tmp/project-verification:size=1g,uid=1000,gid=1000,mode=0700,noexec,nosuid,nodev
+    mem_limit: 2g
+    pids_limit: 256
+    cpus: 2
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=4).status == 200 else 1)"]
+      interval: 15s
+      timeout: 5s
+      start_period: 30s
+      retries: 5
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        VITE_API_URL: ${VITE_API_URL:-http://localhost:8000}
+    restart: unless-stopped
+    environment:
+      # Origin of the API the SPA talks to (scheme://host[:port], no path); used by nginx's CSP.
+      API_ORIGIN: ${API_ORIGIN:-http://localhost:8000}
+    # nginx-unprivileged listens on 8080 inside the container.
+    ports:
+      - "3000:8080"
+    depends_on:
+      backend:
+        condition: service_healthy
+
+volumes:
+  postgres_data:
